@@ -12007,6 +12007,94 @@ ldnmp_backup_action() {
 	printf 'KPANEL_LDNMP_BACKUP %s\n' "$(basename "$archive")"
 }
 
+ldnmp_site_backup_action() {
+	local domain="${1:-}" site_root conf_file dbname dbrootpasswd
+	local stamp archive temporary database_exists entries=()
+	[ -n "$domain" ] || read -r -e -p "请输入要备份的网站域名: " domain
+	ldnmp_site_domain_is_safe "$domain" || return 1
+	site_root="/home/web/html/$domain"
+	conf_file="/home/web/conf.d/$domain.conf"
+	[ -d "$site_root" ] && [ -f "$conf_file" ] || {
+		echo "网站目录或 Nginx 配置不存在: $domain" >&2
+		return 1
+	}
+
+	dbname=$(printf '%s' "$domain" | sed -e 's/[^A-Za-z0-9]/_/g')
+	stamp=$(date '+%Y%m%d%H%M%S')
+	archive="/home/site_${domain}_${stamp}.tar.gz"
+	temporary=$(mktemp -d /home/.kpanel-site-backup.XXXXXX) || return 1
+	mkdir -p "$temporary/site" || { rm -rf "$temporary"; return 1; }
+	cp -a "$site_root/." "$temporary/site/" || { rm -rf "$temporary"; return 1; }
+	cp -a "$conf_file" "$temporary/nginx.conf" || { rm -rf "$temporary"; return 1; }
+	[ -f "/home/web/certs/${domain}_cert.pem" ] && cp -a "/home/web/certs/${domain}_cert.pem" "$temporary/cert.pem"
+	[ -f "/home/web/certs/${domain}_key.pem" ] && cp -a "/home/web/certs/${domain}_key.pem" "$temporary/key.pem"
+
+	database_exists=false
+	if [ -f /home/web/docker-compose.yml ] && docker inspect mysql >/dev/null 2>&1; then
+		dbrootpasswd=$(grep -oP 'MYSQL_ROOT_PASSWORD:\s*\K.*' /home/web/docker-compose.yml | tr -d '[:space:]')
+		if docker exec mysql mysql -u root -p"$dbrootpasswd" -Nse "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME='${dbname}'" 2>/dev/null | grep -Fqx "$dbname"; then
+			database_exists=true
+			docker exec mysql mysqldump -u root -p"$dbrootpasswd" --single-transaction "$dbname" > "$temporary/database.sql" || {
+				rm -rf "$temporary"
+				return 1
+			}
+		fi
+	fi
+	printf 'format=kejilion-ldnmp-site-v1\ndomain=%s\ndatabase=%s\n' "$domain" "$dbname" > "$temporary/metadata"
+	printf 'database_exists=%s\n' "$database_exists" >> "$temporary/metadata"
+	entries=(metadata site nginx.conf)
+	[ "$database_exists" = true ] && entries+=(database.sql)
+	[ -f "$temporary/cert.pem" ] && entries+=(cert.pem)
+	[ -f "$temporary/key.pem" ] && entries+=(key.pem)
+	tar -C "$temporary" -czf "${archive}.tmp" "${entries[@]}" || {
+		rm -rf "$temporary" "${archive}.tmp"
+		return 1
+	}
+	mv -f "${archive}.tmp" "$archive"
+	chmod 600 "$archive"
+	rm -rf "$temporary"
+	echo "单独网站备份完成: $archive"
+}
+
+ldnmp_site_restore_action() {
+	local domain="${1:-}" archive="${2:-}" temporary metadata_domain metadata_db database_exists
+	local dbrootpasswd site_root conf_file
+	[ -n "$domain" ] || read -r -e -p "请输入要恢复的网站域名: " domain
+	ldnmp_site_domain_is_safe "$domain" || return 1
+	[ -n "$archive" ] || read -r -e -p "请输入该网站备份文件名: " archive
+	archive="/home/$(basename -- "$archive")"
+	[ -f "$archive" ] && gzip -t "$archive" || return 1
+	temporary=$(mktemp -d /home/.kpanel-site-restore.XXXXXX) || return 1
+	tar -xzf "$archive" -C "$temporary" || { rm -rf "$temporary"; return 1; }
+	[ -f "$temporary/metadata" ] && [ -d "$temporary/site" ] && [ -f "$temporary/nginx.conf" ] || {
+		rm -rf "$temporary"
+		return 1
+	}
+	metadata_domain=$(sed -n 's/^domain=//p' "$temporary/metadata")
+	metadata_db=$(sed -n 's/^database=//p' "$temporary/metadata")
+	database_exists=$(sed -n 's/^database_exists=//p' "$temporary/metadata")
+	[ "$metadata_domain" = "$domain" ] || { rm -rf "$temporary"; return 1; }
+	[ "$metadata_db" = "$(printf '%s' "$domain" | sed -e 's/[^A-Za-z0-9]/_/g')" ] || { rm -rf "$temporary"; return 1; }
+	site_root="/home/web/html/$domain"
+	conf_file="/home/web/conf.d/$domain.conf"
+	mkdir -p /home/web/html /home/web/conf.d /home/web/certs || { rm -rf "$temporary"; return 1; }
+	rm -rf -- "$site_root"
+	mv "$temporary/site" "$site_root" || { rm -rf "$temporary"; return 1; }
+	cp -a "$temporary/nginx.conf" "$conf_file" || { rm -rf "$temporary"; return 1; }
+	[ ! -f "$temporary/cert.pem" ] || cp -a "$temporary/cert.pem" "/home/web/certs/${domain}_cert.pem"
+	[ ! -f "$temporary/key.pem" ] || cp -a "$temporary/key.pem" "/home/web/certs/${domain}_key.pem"
+	if [ "$database_exists" = true ] && [ -f "$temporary/database.sql" ] &&
+		[ -f /home/web/docker-compose.yml ] && docker inspect mysql >/dev/null 2>&1; then
+		dbrootpasswd=$(grep -oP 'MYSQL_ROOT_PASSWORD:\s*\K.*' /home/web/docker-compose.yml | tr -d '[:space:]')
+		docker exec mysql mysql -u root -p"$dbrootpasswd" -e "CREATE DATABASE IF NOT EXISTS \`$metadata_db\`;" || { rm -rf "$temporary"; return 1; }
+		docker exec -i mysql mysql -u root -p"$dbrootpasswd" "$metadata_db" < "$temporary/database.sql" || { rm -rf "$temporary"; return 1; }
+	fi
+	rm -rf "$temporary"
+	docker exec nginx nginx -t >/dev/null 2>&1 && docker exec nginx nginx -s reload >/dev/null 2>&1 || return 1
+	normalize_ldnmp_site_permissions "$domain" || return 1
+	echo "单独网站恢复完成: $domain"
+}
+
 ldnmp_backup_delete_action() {
 	local name archive
 	name=$(basename "${1:-}")
@@ -12117,6 +12205,8 @@ ldnmp_environment_menu() {
 		echo "6. 更新环境"
 		echo "7. 创建冷备"
 		echo "8. 还原备份"
+		echo "11. 备份单独网站"
+		echo "12. 恢复单独网站"
 		echo "9. 卸载环境"
 		echo "0. 返回"
 		echo "------------------------"
@@ -12140,6 +12230,13 @@ ldnmp_environment_menu() {
 				find /home -maxdepth 1 -type f -name 'web_*.tar.gz' -printf '%f\n' 2>/dev/null | sort -r
 				read -e -p "输入要还原的备份文件名: " backup_name
 				ldnmp_restore_action "$backup_name"
+				;;
+			11) ldnmp_site_backup_action ;;
+			12)
+				read -e -p "请输入要恢复的网站域名: " site_domain
+				find /home -maxdepth 1 -type f -name "site_${site_domain}_*.tar.gz" -printf '%f\n' 2>/dev/null | sort -r
+				read -e -p "输入该网站备份文件名: " site_backup_name
+				ldnmp_site_restore_action "$site_domain" "$site_backup_name"
 				;;
 			9)
 				read -e -p "输入 DELETE 确认卸载 LDNMP 环境: " confirmation
@@ -12175,6 +12272,8 @@ kpanel_ldnmp_dispatch() {
 				kpanel_ldnmp_run backup.create ldnmp_backup_action "$@"
 			fi
 			;;
+		site-backup) kpanel_ldnmp_run site-backup ldnmp_site_backup_action "$@" ;;
+		site-restore) kpanel_ldnmp_run site-restore ldnmp_site_restore_action "$@" ;;
 		restore) kpanel_ldnmp_run restore ldnmp_restore_action "$@" ;;
 		uninstall) kpanel_ldnmp_run uninstall ldnmp_uninstall_action "$@" ;;
 		*) echo "不支持的 LDNMP 环境命令" >&2; return 2 ;;
@@ -12205,6 +12304,7 @@ linux_ldnmp() {
 	echo -e "${gl_huang}------------------------"
 	echo -e "${gl_huang}31.  ${gl_bai}站点数据管理 ${gl_huang}★${gl_bai}                    ${gl_huang}32.  ${gl_bai}备份全站数据"
 	echo -e "${gl_huang}33.  ${gl_bai}定时远程备份                      ${gl_huang}34.  ${gl_bai}还原全站数据"
+	echo -e "${gl_huang}39.  ${gl_bai}备份单独网站                        ${gl_huang}40.  ${gl_bai}恢复单独网站"
 	echo -e "${gl_huang}------------------------"
 	echo -e "${gl_huang}35.  ${gl_bai}防护LDNMP环境                     ${gl_huang}36.  ${gl_bai}优化LDNMP环境"
 	echo -e "${gl_huang}37.  ${gl_bai}更新LDNMP环境                     ${gl_huang}38.  ${gl_bai}卸载LDNMP环境"
@@ -13055,6 +13155,17 @@ linux_ldnmp() {
 		  echo "没有找到压缩包。"
 	  fi
 
+	  ;;
+
+	39)
+	  ldnmp_site_backup_action
+	  ;;
+
+	40)
+	  read -e -p "请输入要恢复的网站域名: " site_domain
+	  find /home -maxdepth 1 -type f -name "site_${site_domain}_*.tar.gz" -printf '%f\n' 2>/dev/null | sort -r
+	  read -e -p "输入该网站备份文件名: " site_backup_name
+	  ldnmp_site_restore_action "$site_domain" "$site_backup_name"
 	  ;;
 
 	35)
